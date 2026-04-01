@@ -153,6 +153,13 @@ type Server struct {
 	shutdownEnd    sync.WaitGroup
 	isShutdown     bool
 	ttl            uint32
+
+	// Rate limiting: track last multicast response time per question name.
+	// RFC 6762 Section 6: "A Multicast DNS responder MUST NOT multicast a
+	// record on a given interface until at least one second has elapsed
+	// since the last time that record was multicast on that interface."
+	rateMu        sync.Mutex
+	lastMulticast map[string]time.Time
 }
 
 // Constructs server structure
@@ -176,6 +183,7 @@ func newServer(ifaces []net.Interface) (*Server, error) {
 		ifaces:         ifaces,
 		ttl:            3200,
 		shouldShutdown: make(chan struct{}),
+		lastMulticast:  make(map[string]time.Time),
 	}
 
 	return s, nil
@@ -328,7 +336,17 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 				err = e
 			}
 		} else {
-			// Send mulicast
+			// Rate limit multicast responses per RFC 6762 Section 6
+			s.rateMu.Lock()
+			last, exists := s.lastMulticast[q.Name]
+			now := time.Now()
+			if exists && now.Sub(last) < time.Second {
+				s.rateMu.Unlock()
+				continue
+			}
+			s.lastMulticast[q.Name] = now
+			s.rateMu.Unlock()
+
 			if e := s.multicastResponse(&resp, ifIndex); e != nil {
 				err = e
 			}
