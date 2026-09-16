@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
@@ -50,9 +49,7 @@ func Register(instance, service, domain string, port int, text []string, ifaces 
 		}
 	}
 
-	if !strings.HasSuffix(trimDot(entry.HostName), entry.Domain) {
-		entry.HostName = fmt.Sprintf("%s.%s.", trimDot(entry.HostName), trimDot(entry.Domain))
-	}
+	entry.HostName = qualifyHostName(entry.HostName, entry.Domain)
 
 	if len(ifaces) == 0 {
 		ifaces = listMulticastInterfaces()
@@ -104,9 +101,7 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 		return nil, fmt.Errorf("missing port")
 	}
 
-	if !strings.HasSuffix(trimDot(entry.HostName), entry.Domain) {
-		entry.HostName = fmt.Sprintf("%s.%s.", trimDot(entry.HostName), trimDot(entry.Domain))
-	}
+	entry.HostName = qualifyHostName(entry.HostName, entry.Domain)
 
 	for _, ip := range ips {
 		ipAddr := net.ParseIP(ip)
