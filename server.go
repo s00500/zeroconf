@@ -143,6 +143,7 @@ type Server struct {
 	service  *ServiceEntry
 	ipv4conn *ipv4.PacketConn
 	ipv6conn *ipv6.PacketConn
+	unicast4 []*ipv4.PacketConn // see listenUnicast
 	ifaces   []net.Interface
 
 	shouldShutdown chan struct{}
@@ -220,6 +221,38 @@ func (s *Server) TTL(ttl uint32) {
 // the hostname, so more would answer the same question several times.
 func (s *Server) AnswerHostQueries(enable bool) {
 	s.answerHost.Store(enable)
+	if enable {
+		s.listenUnicast()
+	}
+}
+
+// listenUnicast binds port 5353 on each interface's own IPv4 address, so
+// queries sent straight to the host (LanScan and other scanners ask every IP
+// for its reverse PTR this way) reach this server. Every mDNS stack binds
+// 0.0.0.0:5353 and Linux hands a unicast datagram to only one of those
+// sockets, the last bound, which on skaarOS is avahi with publishing
+// disabled. A socket bound to the address itself wins over all of them
+// regardless of bind order.
+func (s *Server) listenUnicast() {
+	s.shutdownLock.Lock()
+	defer s.shutdownLock.Unlock()
+	if s.isShutdown || len(s.unicast4) > 0 {
+		return
+	}
+	for i := range s.ifaces {
+		iface := s.ifaces[i]
+		v4, _ := addrsForInterface(&iface)
+		for _, ip := range v4 {
+			conn, err := listenUnicastUDP4(&net.UDPAddr{IP: ip, Port: 5353})
+			if err != nil {
+				log.Printf("[zeroconf] no unicast listener on %s: %s", ip, err)
+				continue
+			}
+			pc := ipv4.NewPacketConn(conn)
+			s.unicast4 = append(s.unicast4, pc)
+			go s.recvUnicast4(pc, iface.Index)
+		}
+	}
 }
 
 // Shutdown server will close currently open connections & channel
@@ -239,6 +272,9 @@ func (s *Server) shutdown() error {
 	}
 	if s.ipv6conn != nil {
 		s.ipv6conn.Close()
+	}
+	for _, c := range s.unicast4 {
+		c.Close()
 	}
 
 	// Wait for connection and routines to be closed
@@ -269,7 +305,7 @@ func (s *Server) recv4(c *ipv4.PacketConn) {
 			if cm != nil {
 				ifIndex = cm.IfIndex
 			}
-			_ = s.parsePacket(buf[:n], ifIndex, from)
+			_ = s.parsePacket(buf[:n], ifIndex, from, false)
 		}
 	}
 }
@@ -295,23 +331,44 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 			if cm != nil {
 				ifIndex = cm.IfIndex
 			}
-			_ = s.parsePacket(buf[:n], ifIndex, from)
+			_ = s.parsePacket(buf[:n], ifIndex, from, false)
 		}
 	}
 }
 
-// parsePacket is used to parse an incoming packet
-func (s *Server) parsePacket(packet []byte, ifIndex int, from net.Addr) error {
+// recvUnicast4 serves a socket from listenUnicast. Everything on it was sent
+// to this host directly, on the interface it is bound to.
+func (s *Server) recvUnicast4(c *ipv4.PacketConn, ifIndex int) {
+	buf := make([]byte, 65536)
+	s.shutdownEnd.Add(1)
+	defer s.shutdownEnd.Done()
+	for {
+		select {
+		case <-s.shouldShutdown:
+			return
+		default:
+			n, _, from, err := c.ReadFrom(buf)
+			if err != nil {
+				continue
+			}
+			_ = s.parsePacket(buf[:n], ifIndex, from, true)
+		}
+	}
+}
+
+// parsePacket is used to parse an incoming packet. direct marks a packet that
+// was addressed to this host rather than to the multicast group.
+func (s *Server) parsePacket(packet []byte, ifIndex int, from net.Addr, direct bool) error {
 	var msg dns.Msg
 	if err := msg.Unpack(packet); err != nil {
 		// log.Printf("[ERR] zeroconf: Failed to unpack packet: %v", err)
 		return err
 	}
-	return s.handleQuery(&msg, ifIndex, from)
+	return s.handleQuery(&msg, ifIndex, from, direct)
 }
 
 // handleQuery is used to handle an incoming query
-func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
+func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr, direct bool) error {
 	// Ignore questions with authoritative section for now
 	if len(query.Ns) > 0 {
 		return nil
@@ -337,7 +394,14 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 			continue
 		}
 
-		if isUnicastQuestion(q) {
+		legacy := isLegacyQuery(from)
+		if legacy {
+			toLegacyResponse(&resp, q)
+		}
+
+		// RFC6762 section 5.5 and 6.7: direct and legacy queries are answered
+		// to the sender, which may not be listening on the multicast group
+		if direct || legacy || isUnicastQuestion(q) {
 			// Send unicast
 			if e := s.unicastResponse(&resp, ifIndex, from); e != nil {
 				err = e
@@ -865,6 +929,29 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 		}
 	}
 	return nil
+}
+
+// isLegacyQuery reports a query from a one-shot resolver rather than an mDNS
+// stack, recognisable by its source port (RFC6762 section 6.7)
+func isLegacyQuery(from net.Addr) bool {
+	addr, ok := from.(*net.UDPAddr)
+	return ok && addr.Port != 5353
+}
+
+// toLegacyResponse adapts a response for a legacy resolver (RFC6762 section
+// 6.7): it repeats the question, caps TTLs at 10s and drops the cache-flush
+// bit, which a plain DNS client would read as a class.
+func toLegacyResponse(resp *dns.Msg, q dns.Question) {
+	resp.Question = []dns.Question{q}
+	for _, rrs := range [][]dns.RR{resp.Answer, resp.Extra} {
+		for _, rr := range rrs {
+			hdr := rr.Header()
+			hdr.Class &^= qClassCacheFlush
+			if hdr.Ttl > 10 {
+				hdr.Ttl = 10
+			}
+		}
+	}
 }
 
 func isUnicastQuestion(q dns.Question) bool {

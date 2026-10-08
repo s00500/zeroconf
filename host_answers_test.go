@@ -73,3 +73,26 @@ func TestHostAddressQueries(t *testing.T) {
 		t.Fatalf("want A and AAAA for ANY, got %v", resp.Answer)
 	}
 }
+
+func TestLegacyResponse(t *testing.T) {
+	if !isLegacyQuery(&net.UDPAddr{IP: net.ParseIP("192.168.0.111"), Port: 63971}) {
+		t.Fatal("random source port not treated as legacy")
+	}
+	if isLegacyQuery(&net.UDPAddr{IP: net.ParseIP("192.168.0.111"), Port: 5353}) {
+		t.Fatal("mDNS source port treated as legacy")
+	}
+
+	s := hostAnswerServer(true)
+	q := dns.Question{Name: "50.0.168.192.in-addr.arpa.", Qtype: dns.TypePTR, Qclass: dns.ClassINET}
+	resp := ask(s, q.Name, q.Qtype)
+	toLegacyResponse(resp, q)
+
+	if len(resp.Question) != 1 || resp.Question[0] != q {
+		t.Fatalf("legacy response must repeat the question, got %v", resp.Question)
+	}
+	for _, rr := range append(resp.Answer, resp.Extra...) {
+		if hdr := rr.Header(); hdr.Ttl > 10 || hdr.Class != dns.ClassINET {
+			t.Fatalf("want TTL <= 10 and plain IN class, got %v", rr)
+		}
+	}
+}
