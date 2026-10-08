@@ -8,7 +8,9 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -148,6 +150,7 @@ type Server struct {
 	shutdownEnd    sync.WaitGroup
 	isShutdown     bool
 	ttl            uint32
+	answerHost     atomic.Bool
 
 	// Rate limiting: track last multicast response time per question name.
 	// RFC 6762 Section 6: "A Multicast DNS responder MUST NOT multicast a
@@ -208,6 +211,15 @@ func (s *Server) SetText(text []string) {
 // TTL sets the TTL for DNS replies
 func (s *Server) TTL(ttl uint32) {
 	s.ttl = ttl
+}
+
+// AnswerHostQueries makes the server answer direct A/AAAA queries for its
+// hostname and reverse (in-addr.arpa / ip6.arpa) PTR queries for its
+// addresses, so the host resolves by name and by address without browsing a
+// service first. Enable it on one server per host only: every server shares
+// the hostname, so more would answer the same question several times.
+func (s *Server) AnswerHostQueries(enable bool) {
+	s.answerHost.Store(enable)
 }
 
 // Shutdown server will close currently open connections & channel
@@ -399,6 +411,12 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 	case s.service.ServiceInstanceName():
 		s.composeLookupAnswers(resp, s.ttl, ifIndex, false)
 	default:
+		if s.answerHost.Load() {
+			s.composeHostAnswers(q, resp, ifIndex)
+			if len(resp.Answer) > 0 {
+				break
+			}
+		}
 		// handle matching subtype query
 		for _, subtype := range s.service.Subtypes {
 			subtype = fmt.Sprintf("%s._sub.%s", subtype, s.service.ServiceName())
@@ -629,7 +647,53 @@ func (s *Server) unregister() error {
 	return s.multicastResponse(resp, 0)
 }
 
-func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache bool) []dns.RR {
+// composeHostAnswers answers a query for the hostname's A/AAAA records or for
+// the reverse PTR of one of its addresses. These are unique records, so they
+// carry the cache-flush bit.
+func (s *Server) composeHostAnswers(q dns.Question, resp *dns.Msg, ifIndex int) {
+	if strings.EqualFold(q.Name, s.service.HostName) {
+		var addrs []dns.RR
+		for _, rr := range s.appendAddrs(nil, s.ttl, ifIndex, true) {
+			if q.Qtype == dns.TypeANY || rr.Header().Rrtype == q.Qtype {
+				addrs = append(addrs, rr)
+			}
+		}
+		resp.Answer = append(resp.Answer, addrs...)
+		return
+	}
+
+	if q.Qtype != dns.TypePTR && q.Qtype != dns.TypeANY {
+		return
+	}
+	lower := strings.ToLower(q.Name)
+	if !strings.HasSuffix(lower, ".in-addr.arpa.") && !strings.HasSuffix(lower, ".ip6.arpa.") {
+		return
+	}
+	v4, v6 := s.addrs(ifIndex)
+	ips := make([]net.IP, 0, len(v4)+len(v6))
+	ips = append(append(ips, v4...), v6...)
+	for _, ip := range ips {
+		reverse, err := dns.ReverseAddr(ip.String())
+		if err != nil || !strings.EqualFold(reverse, q.Name) {
+			continue
+		}
+		resp.Answer = append(resp.Answer, &dns.PTR{
+			Hdr: dns.RR_Header{
+				Name:   q.Name,
+				Rrtype: dns.TypePTR,
+				Class:  dns.ClassINET | qClassCacheFlush,
+				Ttl:    120, // address-bound like A/AAAA, RFC6762 section 10
+			},
+			Ptr: s.service.HostName,
+		})
+		resp.Extra = s.appendAddrs(resp.Extra, s.ttl, ifIndex, true)
+		return
+	}
+}
+
+// addrs returns the service's fixed addresses, or those of the interface the
+// query arrived on when none are set
+func (s *Server) addrs(ifIndex int) ([]net.IP, []net.IP) {
 	v4 := s.service.AddrIPv4
 	v6 := s.service.AddrIPv6
 	if len(v4) == 0 && len(v6) == 0 {
@@ -640,6 +704,11 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 			v6 = append(v6, a6...)
 		}
 	}
+	return v4, v6
+}
+
+func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache bool) []dns.RR {
+	v4, v6 := s.addrs(ifIndex)
 	if ttl > 0 {
 		// RFC6762 Section 10 says A/AAAA records SHOULD
 		// use TTL of 120s, to account for network interface
