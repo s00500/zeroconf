@@ -3,6 +3,7 @@ package zeroconf
 import (
 	"fmt"
 	"net"
+	"strings"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -108,10 +109,20 @@ func listMulticastInterfaces() []net.Interface {
 		if (ifi.Flags & net.FlagUp) == 0 {
 			continue
 		}
+		if isVPNInterface(ifi.Name) {
+			continue
+		}
 		if (ifi.Flags & net.FlagMulticast) > 0 {
 			interfaces = append(interfaces, ifi)
 		}
 	}
 
 	return interfaces
+}
+
+// isVPNInterface reports whether name is a Tailscale, WireGuard or ZeroTier
+// interface. mDNS must never go out on these, or the host is announced to
+// every peer of the overlay network
+func isVPNInterface(name string) bool {
+	return strings.HasPrefix(name, "tailscale") || strings.HasPrefix(name, "wg") || strings.HasPrefix(name, "zt")
 }
